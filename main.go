@@ -26,6 +26,7 @@ type Endpoint struct {
 }
 
 var haproxy *os.Process
+var haproxyDesiredState bool
 
 func main() {
 
@@ -63,23 +64,30 @@ func main() {
 				})
 			}
 
-			// generate config & hash
-			config, hash, err := generateHAProxyConfig(group)
+			if len(group) > 0 {
 
-			// compare last hash with new generated hash
-			if strings.Compare(lastHash, hash) != 0 {
-				fmt.Println("Backends changed. Reconfiguring haproxy with:")
-				for port, backends := range group {
-					fmt.Println("\nPublish port", port, "TCP")
-					for _, backend := range backends {
-						fmt.Println("Backend", backend.Name, "at", backend.IP, "port", backend.Port)
+				// generate config & hash
+				config, hash, _ := generateHAProxyConfig(group)
+
+				// compare last hash with new generated hash
+				if strings.Compare(lastHash, hash) != 0 {
+					fmt.Println("Backends changed. Reconfiguring haproxy with:")
+					for port, backends := range group {
+						fmt.Println("\nPublish port", port, "TCP")
+						for _, backend := range backends {
+							fmt.Println("  |- Backend", backend.Name, "at", backend.IP, "port", backend.Port)
+						}
 					}
-				}
 
-				writeHAProxyConfig(config)
-				signalOrStartHAProxy(evt)
-				lastHash = hash
+					writeHAProxyConfig(config)
+					signalOrStartHAProxy(evt)
+					lastHash = hash
+				}
+			} else {
+				stopHAProxyIfStarted()
+				lastHash = "-1"
 			}
+
 			time.Sleep(5 * time.Second)
 		}
 	}(evt)
@@ -180,12 +188,22 @@ func writeHAProxyConfig(config string) error {
 	return nil
 }
 
+func stopHAProxyIfStarted() {
+	haproxyDesiredState = false
+	fmt.Println("No container found with label lb.enable=Y")
+	if haproxy != nil {
+		fmt.Println("Stopping haproxy")
+		haproxy.Signal(syscall.SIGTERM)
+	}
+}
+
 func signalOrStartHAProxy(evt chan int) {
+	haproxyDesiredState = true
 	if haproxy == nil {
 
 		if binary, err := exec.LookPath("haproxy"); err == nil {
 			go func() {
-				restarts :=0
+				restarts := 0
 				for restarts < 5 {
 					var procAttr os.ProcAttr
 					procAttr.Files = []*os.File{os.Stdin, os.Stdout, os.Stderr}
@@ -194,12 +212,21 @@ func signalOrStartHAProxy(evt chan int) {
 					if err != nil {
 						panic(err)
 					}
-					fmt.Println("Started HAProxy with pid", haproxy.Pid)
+					fmt.Println("Started haproxy with pid", haproxy.Pid)
+
 					haproxy.Wait()
-					fmt.Println("HAProxy died, restarting in 10 seconds")
-					time.Sleep(10 * time.Second)
-					haproxy.Kill()
-					restarts++
+					if haproxyDesiredState {
+						fmt.Println("haproxy died, restarting in 10 seconds")
+						time.Sleep(10 * time.Second)
+						haproxy.Kill()
+						haproxy = nil
+						restarts++
+					} else {
+						fmt.Println("haproxy stopped.")
+						haproxy = nil
+						return
+					}
+
 				}
 				fmt.Println("haproxy has restarted", restarts, "times. Terminating loadbalancer")
 				evt <- -1
