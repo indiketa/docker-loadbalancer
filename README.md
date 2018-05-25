@@ -12,7 +12,13 @@ If you have any questions, please open an issue.
 Create a simple web application and annotate with labels:
 
 ```
-docker run -d --rm --label "lb.enable=Y" --label "lb.publish=80" --label "lb.target=80" --name web1 nginx:alpine
+docker run -d \
+         --rm \
+         --label "lb.enable=Y"  \
+         --label "lb.publish=80" \
+         --label "lb.target=80" \
+         --name web1 \
+         nginx:alpine
 ```
 - Label ```lb.enable=Y``` Makes this container eligible for load balancer.
 - Label ```lb.publish=80``` Indicates the port published by the lb.
@@ -21,7 +27,12 @@ docker run -d --rm --label "lb.enable=Y" --label "lb.publish=80" --label "lb.tar
 Instantiate the load balancer:
 
 ```
-docker run -d --net host -v /var/run/docker.sock:/var/run/docker.sock --name lb indiketa/docker-loadbalancer
+docker run \
+        -d \
+        --net host \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        --name lb \
+        indiketa/docker-loadbalancer
 ```
 The loadbalancer is autoconfigured and serving ```web1``` container directly. (you can use the bridge network, but then you have to publish frontend ports when launching loadbalancer container). 
 
@@ -38,8 +49,15 @@ Started HAProxy with pid 12
 ```
 
 Add another webserver:
+
 ```
-docker run -d --rm --label "lb.enable=Y" --label "lb.publish=80" --label "lb.target=80" --name web3 nginx:alpine
+docker run -d \
+         --rm \
+         --label "lb.enable=Y"  \
+         --label "lb.publish=80" \
+         --label "lb.target=80" \
+         --name web2 \
+         nginx:alpine
 ```
 Check if loadbalancer is reconfigured:
 ```
