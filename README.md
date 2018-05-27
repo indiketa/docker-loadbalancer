@@ -1,10 +1,10 @@
 # docker-loadbalancer
 Automatic haproxy-based docker load balancer. 
 
-This container implements a container load balancer (only for containers running in a single host). The load balancer configures itself automatically.
+This container implements a container load balancer (containers running in a same host). Load balancer is configured automatically.
 
 ## Use case
-Imagine you have (in a single host) 5 containers of ```nginx``` and you want to balance the incoming traffic between them, you need a loadbalancer. This loadbalancer is autoconfigured reading target container labels.
+Imagine you have 5 containers of ```nginx``` and you want to balance the incoming traffic between them, you need a loadbalancer. This loadbalancer is autoconfigured reading target container labels.
 
 If you have any questions, please open an issue.
 
@@ -93,5 +93,5 @@ The constraint is a host selector.
 
 
 ## Changes
-```main.go``` file contains the source code of the (stupid) configurator, run `compile.sh` to generate a load balancer image: First ```main.go``` is compiled (using a container) and then loadbalancer image is built.
+```main.go``` contains all the source, Exec `compile.sh` to generate the load balancer executable, and then the image.
 
