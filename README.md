@@ -91,6 +91,47 @@ docker service create \
 ```
 The constraint is a host selector. 
 
+## haproxy config template
+Mount  ```/haproxy.tmpl``` to override default haproxy configuration:
+
+```
+global
+   stats timeout 30s
+   daemon
+
+defaults
+    mode                    tcp
+    log                     global
+    option                  httplog
+    option                  dontlognull
+    option 				  	http-server-close
+    option                  redispatch
+    retries                 3
+    timeout http-request    10s
+    timeout queue           1m
+    timeout connect         10s
+    timeout client          1m
+    timeout server          1m
+    timeout http-keep-alive 10s
+    timeout check           10s
+	maxconn                 3000
+
+{{range $key, $value := .}}frontend port_{{$key}}
+    bind *:{{$key}}
+    mode tcp
+    option tcplog
+    timeout client  10800s
+    default_backend port_{{$key}}_backends
+
+backend port_{{$key}}_backends
+    mode tcp
+    balance leastconn
+    timeout server  10800s
+	{{range .}}server {{.Name}} {{.IP}}:{{.Port}}
+	{{end}}
+{{end}}
+```
+
 
 ## Changes
 ```main.go``` contains all the source, Exec `compile.sh` to generate the load balancer executable, and then the image.
