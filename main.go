@@ -164,7 +164,7 @@ backend port_{{$key}}_backends
 
 	if _, err := os.Stat("/haproxy.tmpl"); err == nil {
 		b, err := ioutil.ReadFile("/haproxy.tmpl")
-		if err != nil {
+		if err == nil {
 			conf = string(b)
 		}
 	}
