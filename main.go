@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"text/template"
 	"time"
+	"io/ioutil"
 )
 
 type Endpoint struct {
@@ -123,7 +124,7 @@ func readContainerNetwork(container types.Container, group map[int][]Endpoint) (
 
 func generateHAProxyConfig(group map[int][]Endpoint) (config string, hash string, err error) {
 
-	const conf = `
+	 conf := `
 global
    stats timeout 30s
    daemon
@@ -160,7 +161,17 @@ backend port_{{$key}}_backends
 	{{end}}
 {{end}}
 `
+
+	if _, err := os.Stat("/haproxy.tmpl"); err == nil {
+		b, err := ioutil.ReadFile("/haproxy.tmpl")
+		if err != nil {
+			conf = string(b)
+		}
+	}
+
 	t := template.Must(template.New("conf").Parse(conf))
+
+
 	buf := new(bytes.Buffer)
 	err = t.Execute(buf, group)
 	if err != nil {
