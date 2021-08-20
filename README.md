@@ -72,7 +72,7 @@ Wrote  820  bytes in  /usr/local/etc/haproxy/haproxy.cfg
 Signaling HAProxy with SIGUSR2, pid 12
 ```
 All works.  Simple but effective haproxy load balancer. 
-Haproxy is configured to balance the traffic using tcp mode (not http), you can balance anything.
+Haproxy is configured to balance the traffic using http mode, but you can reconfigure the HAProxy template to use tcp if you need.
 
 
 ## Real-life usage
@@ -96,16 +96,23 @@ Mount  ```/haproxy.tmpl``` to override default haproxy configuration:
 
 ```
 global
-   stats timeout 30s
    daemon
+   stats socket {{$.SockFile}} mode 600 expose-fd listeners level user
+   stats timeout 30s 
+   pidfile {{$.PidFile}}
+   log /dev/log local0 debug
 
 defaults
-    mode                    tcp
+    mode                    http
     log                     global
     option                  httplog
     option                  dontlognull
-    option 				  	http-server-close
+    option                  http-server-close
     option                  redispatch
+    option                  forwardfor
+    option                  originalto
+    compression algo        gzip
+    compression type        text/css text/html text/javascript application/javascript text/plain text/xml application/json
     retries                 3
     timeout http-request    10s
     timeout queue           1m
@@ -114,20 +121,26 @@ defaults
     timeout server          1m
     timeout http-keep-alive 10s
     timeout check           10s
-	maxconn                 3000
+    maxconn                 3000{{if .Stats}}
 
-{{range $key, $value := .}}frontend port_{{$key}}
-    bind *:{{$key}}
-    mode tcp
-    option tcplog
-    timeout client  10800s
-    default_backend port_{{$key}}_backends
+listen stats
+    bind *:{{.StatsPort}}
+    stats enable
+    stats hide-version
+    stats refresh 5s
+    stats show-node
+    stats uri  /{{end}}
 
-backend port_{{$key}}_backends
-    mode tcp
+{{range $_, $value := .Services}}frontend port_{{$value.Publish.IP}}_{{$value.Publish.Port}}
+    bind {{if $value.Publish.IP}}{{$value.Publish.IP}}{{else}}*{{end}}:{{$value.Publish.Port}}{{if $value.Publish.Ssl}} ssl crt {{$value.Publish.Ssl}}{{end}}
+    default_backend port_{{$value.Publish.IP}}_{{$value.Publish.Port}}_backends
+    rspdel ^ETag:.*
+
+backend port_{{$value.Publish.IP}}_{{$value.Publish.Port}}_backends
     balance leastconn
-    timeout server  10800s
-	{{range .}}server {{.Name}} {{.IP}}:{{.Port}}
+    stick-table type ip size 200k expire 520m    
+    stick on src
+    {{range $value.Backends}}server {{.Name}} {{.IP}}:{{.Port}} 
 	{{end}}
 {{end}}
 ```
@@ -135,4 +148,6 @@ backend port_{{$key}}_backends
 
 ## Changes
 ```main.go``` contains all the source, Exec `compile.sh` to generate the load balancer executable, and then the image.
+
+20/08/2021 - Achiveved 0 packet loss between reconfigurations (HAProxy restarts): All connections are handled in a separated socket file, the old (dying) HAProxy sends the state to the new HAProxy instance.
 
