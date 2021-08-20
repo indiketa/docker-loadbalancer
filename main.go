@@ -1,23 +1,25 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/md5"
 	"encoding/hex"
-	"fmt"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"golang.org/x/net/context"
+	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"text/template"
 	"time"
-	"io/ioutil"
 )
 
 type Endpoint struct {
@@ -26,82 +28,200 @@ type Endpoint struct {
 	Port int
 }
 
-var haproxy *os.Process
-var haproxyDesiredState bool
+type GroupKey struct {
+	Port int
+	IP string
+	Ssl  string
+}
+
+type ServiceConfiguration struct {
+	Publish  GroupKey
+	Backends []Endpoint
+}
+
+type WholeConfiguration struct {
+	Services  []ServiceConfiguration
+	StatsPort int
+	Stats     string
+}
+
+type HaProxyTemplateModel struct {
+	Services  []ServiceConfiguration
+	Stats     string
+	StatsPort int
+	PidFile   string
+	SockFile  string
+}
+
+var haproxyBinary string
+var lastHash = "-1"
+var statsPort = -1
+var containerCheckTime = 5
+var haproxyPidFile = "/tmp/haproxy.pid"
+var haproxySock = "/tmp/haproxy.sock"
+var noServicesPrinted = false
+
+const haproxyConfig = "/usr/local/etc/haproxy/haproxy.cfg"
 
 func main() {
 
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts()
+	readEnvironmentConfiguration()
+	startHAProxyIdleInstance()
+
+	exit_chan := make(chan int, 1)
+	signal_chan := make(chan os.Signal, 1)
+	signal.Notify(signal_chan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+
+	go func() {
+		<-signal_chan
+		log.Println("Exit signal received")
+		if pid, process := findRunningHAProxyPid(); pid > 0 {
+			log.Println("Sending 0x9 (SIGKILL) to HAProxy pid ", pid)
+			process.Signal(syscall.SIGKILL)
+		}
+		exit_chan <- 0
+	}()
+
+	go func() {
+		ctx := context.Background()
+		cli, err := client.NewClientWithOpts()
+		if err != nil {
+			panic(err)
+		}
+
+		for {
+			services := readServices(cli, ctx)
+			if len(services) == 0 {
+				if !noServicesPrinted {
+					log.Println("No container found with label lb.enable=si")
+					noServicesPrinted = true
+				}
+			} else {
+				noServicesPrinted = false
+			}
+
+			conf := WholeConfiguration{StatsPort: statsPort, Services: services}
+			config, hash, _ := generateHAProxyConfig(conf)
+			if strings.Compare(lastHash, hash) != 0 {
+				printCurrentServices(conf)
+				applyConfiguration(config, hash)
+			}
+			time.Sleep(time.Duration(containerCheckTime) * time.Second)
+		}
+	}()
+
+	code := <-exit_chan
+	log.Println("auto-lb terminated")
+	os.Exit(code)
+
+}
+
+func startHAProxyIdleInstance() {
+	var err error
+	if haproxyBinary, err = exec.LookPath("haproxy"); err == nil {
+		conf := WholeConfiguration{StatsPort: statsPort, Services: make([]ServiceConfiguration, 0)}
+		config, hash, _ := generateHAProxyConfig(conf)
+		applyConfiguration(config, hash)
+	} else {
+		log.Fatal("haproxy executable not found ")
+	}
+}
+
+func applyConfiguration(config, hash string) {
+	writeFile(config, haproxyConfig)
+	startNewHAProxy()
+	lastHash = hash
+}
+
+func readEnvironmentConfiguration() {
+	statsPort = readEnvInteger("LB_STATS_PORT")
+	if statsPort > 0 {
+		log.Println("HAProxy statistics port is", statsPort)
+	}
+
+	containerCheckTime = readEnvInteger("CHECK_TIME")
+	if containerCheckTime <= 0 {
+		containerCheckTime = 5
+	}
+	log.Println("Container refresh interval check is", containerCheckTime, "seconds")
+
+	if len(os.Getenv("HAPROXY_PID_FILE")) > 0 {
+		haproxyPidFile = os.Getenv("HAPROXY_PID_FILE")
+	}
+
+	if len(os.Getenv("HAPROXY_SOCK_FILE")) > 0 {
+		haproxySock = os.Getenv("HAPROXY_SOCK_FILE")
+	}
+
+}
+
+func readEnvInteger(name string) (retval int) {
+	strValue := os.Getenv(name)
+	retval = -1
+
+	if len(strValue) != 0 {
+		stat, err := strconv.Atoi(strValue)
+		if err == nil {
+			retval = stat
+		} else {
+			panic("Label " + name + " port not convertible to integer: " + strValue)
+		}
+	}
+	return
+}
+
+func printCurrentServices(whole WholeConfiguration) {
+	log.Println("Backends change dectected. Reconfiguring haproxy with:")
+	for _, service := range whole.Services {
+		proto := "HTTP"
+		if len(service.Publish.Ssl) > 0 {
+			proto = "SSL"
+		}
+		log.Println("")
+		log.Println("Publish port", service.Publish.Port, proto, service.Publish.Ssl)
+		for _, backend := range service.Backends {
+			log.Println("  |- Backend", backend.Name, "at", backend.IP, "port", backend.Port)
+		}
+	}
+}
+
+func readServices(cli *client.Client, ctx context.Context) []ServiceConfiguration {
+
+	group := make(map[GroupKey][]Endpoint)
+
+	filters := filters.NewArgs(filters.KeyValuePair{Key: "label", Value: "lb.enable=Y"})
+	containers, err := cli.ContainerList(ctx, types.ContainerListOptions{Filters: filters})
 	if err != nil {
 		panic(err)
 	}
 
-	evt := make(chan int, 1)
+	// group containers by publish port
+	for _, val := range containers {
+		processContainer(val, group)
+	}
 
-	go func(evt chan int) {
+	services := make([]ServiceConfiguration, 0)
 
-		lastHash := "-1"
+	// order endpoints by name
+	for key, value := range group {
+		sort.Slice(value, func(i, j int) bool {
+			return strings.Compare(value[i].Name, value[j].Name) < 0
+		})
+		services = append(services, ServiceConfiguration{Backends: value, Publish: key})
+	}
 
-		filters := filters.NewArgs(filters.KeyValuePair{Key: "label", Value: "lb.enable=Y"})
+	// order services by publish port asc
+	sort.Slice(services, func(i, j int) bool {
+		return services[i].Publish.IP + " " + strconv.Itoa(services[i].Publish.Port) <  services[j].Publish.IP + " " + strconv.Itoa(services[j].Publish.Port)
+	})
 
-		for {
-			containers, err := cli.ContainerList(ctx, types.ContainerListOptions{Filters: filters})
-			if err != nil {
-				panic(err)
-			}
-
-			group := make(map[int][]Endpoint)
-
-			// group containers by publish port
-			for index := range containers {
-				readContainerNetwork(containers[index], group)
-			}
-
-			// order endpoints by name
-			for _, value := range group {
-				sort.Slice(value, func(i, j int) bool {
-					return strings.Compare(value[i].Name, value[j].Name) < 0
-				})
-			}
-
-			if len(group) > 0 {
-
-				// generate config & hash
-				config, hash, _ := generateHAProxyConfig(group)
-
-				// compare last hash with new generated hash
-				if strings.Compare(lastHash, hash) != 0 {
-					fmt.Println("Backends changed. Reconfiguring haproxy with:")
-					for port, backends := range group {
-						fmt.Println("\nPublish port", port, "TCP")
-						for _, backend := range backends {
-							fmt.Println("  |- Backend", backend.Name, "at", backend.IP, "port", backend.Port)
-						}
-					}
-
-					writeHAProxyConfig(config)
-					signalOrStartHAProxy(evt)
-					lastHash = hash
-				}
-			} else {
-				stopHAProxyIfStarted()
-				lastHash = "-1"
-			}
-
-			time.Sleep(5 * time.Second)
-		}
-	}(evt)
-
-	<-evt
-	fmt.Println("auto-lb terminated")
-
+	return services
 }
 
-func readContainerNetwork(container types.Container, group map[int][]Endpoint) (err error) {
+func processContainer(container types.Container, group map[GroupKey][]Endpoint) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Println("Container ", container.Names[0][1:], " skipped, due to error: ", r)
+			log.Println("Container", container.Names[0][1:], "skipped due to error: ", r)
 		}
 	}()
 
@@ -115,27 +235,47 @@ func readContainerNetwork(container types.Container, group map[int][]Endpoint) (
 		panic("Label lb.target not found or not convertible to integer")
 	}
 
+	dst_address := container.Labels["lb.dst_addr"]
+
+	key := GroupKey{Port: publish, IP:dst_address}
+
+	if len(container.Labels["lb.ssl"]) != 0 {
+		sslFile := container.Labels["lb.ssl"]
+		if _, err := os.Stat(sslFile); os.IsNotExist(err) {
+			panic("Label lb.ssl pem file does not exist: " + sslFile)
+		} else {
+			key.Ssl = sslFile
+		}
+	}
+
 	for m := range container.NetworkSettings.Networks {
-		group[publish] = append(group[publish], Endpoint{container.Names[0][1:], container.NetworkSettings.Networks[m].IPAddress, target})
+		group[key] = append(group[key], Endpoint{container.Names[0][1:], container.NetworkSettings.Networks[m].IPAddress,target})
 	}
 
 	return nil
 }
 
-func generateHAProxyConfig(group map[int][]Endpoint) (config string, hash string, err error) {
+func generateHAProxyConfig(whole WholeConfiguration) (config string, hash string, err error) {
 
-	 conf := `
+	conf := `
 global
-   stats timeout 30s
    daemon
+   stats socket {{$.SockFile}} mode 600 expose-fd listeners level user
+   stats timeout 30s 
+   pidfile {{$.PidFile}}
+   log /dev/log local0 debug
 
 defaults
-    mode                    tcp
+    mode                    http
     log                     global
     option                  httplog
     option                  dontlognull
-    option 				  	http-server-close
+    option                  http-server-close
     option                  redispatch
+    option                  forwardfor
+    option                  originalto
+    compression algo        gzip
+    compression type        text/css text/html text/javascript application/javascript text/plain text/xml application/json
     retries                 3
     timeout http-request    10s
     timeout queue           1m
@@ -144,20 +284,26 @@ defaults
     timeout server          1m
     timeout http-keep-alive 10s
     timeout check           10s
-	maxconn                 3000
+    maxconn                 3000{{if .Stats}}
 
-{{range $key, $value := .}}frontend port_{{$key}}
-    bind *:{{$key}}
-    mode tcp
-    option tcplog
-    timeout client  10800s
-    default_backend port_{{$key}}_backends
+listen stats
+    bind *:{{.StatsPort}}
+    stats enable
+    stats hide-version
+    stats refresh 5s
+    stats show-node
+    stats uri  /{{end}}
 
-backend port_{{$key}}_backends
-    mode tcp
+{{range $_, $value := .Services}}frontend port_{{$value.Publish.IP}}_{{$value.Publish.Port}}
+    bind {{if $value.Publish.IP}}{{$value.Publish.IP}}{{else}}*{{end}}:{{$value.Publish.Port}}{{if $value.Publish.Ssl}} ssl crt {{$value.Publish.Ssl}}{{end}}
+    default_backend port_{{$value.Publish.IP}}_{{$value.Publish.Port}}_backends
+    rspdel ^ETag:.*
+
+backend port_{{$value.Publish.IP}}_{{$value.Publish.Port}}_backends
     balance leastconn
-    timeout server  10800s
-	{{range .}}server {{.Name}} {{.IP}}:{{.Port}}
+    stick-table type ip size 200k expire 520m    
+    stick on src
+    {{range $value.Backends}}server {{.Name}} {{.IP}}:{{.Port}} 
 	{{end}}
 {{end}}
 `
@@ -171,14 +317,27 @@ backend port_{{$key}}_backends
 
 	t := template.Must(template.New("conf").Parse(conf))
 
-
 	buf := new(bytes.Buffer)
-	err = t.Execute(buf, group)
+
+	stats := ""
+	if whole.StatsPort > 0 {
+		stats = "Y"
+	}
+
+	model := HaProxyTemplateModel{Services: whole.Services,
+		Stats:     stats,
+		StatsPort: whole.StatsPort,
+		PidFile:   haproxyPidFile,
+		SockFile:  haproxySock}
+
+	err = t.Execute(buf, model)
 	if err != nil {
 		panic(err)
 	}
 
 	config = buf.String()
+
+	//log.Println(config)
 
 	hasher := md5.New()
 	hasher.Write([]byte(config))
@@ -187,70 +346,66 @@ backend port_{{$key}}_backends
 	return
 }
 
-func writeHAProxyConfig(config string) error {
-	f, err := os.Create("/usr/local/etc/haproxy/haproxy.cfg")
+func writeFile(config, name string) error {
+	f, err := os.Create(name)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer f.Close()
 	n3, err := f.WriteString(config)
-	fmt.Println("Wrote ", n3, " bytes in ", f.Name())
-
-	return nil
+	log.Println("Wrote", n3, "bytes to", f.Name())
+	return err
 }
 
-func stopHAProxyIfStarted() {
-	haproxyDesiredState = false
-	fmt.Println("No container found with label lb.enable=Y")
-	if haproxy != nil {
-		fmt.Println("Stopping haproxy")
-		haproxy.Signal(syscall.SIGTERM)
-	}
-}
+func findRunningHAProxyPid() (pid int, process *os.Process) {
+	pid = -1
+	if file, err := os.Open(haproxyPidFile); err == nil {
+		defer file.Close()
+		if scanner := bufio.NewScanner(file); scanner.Scan() {
+			firstLine := scanner.Text()
 
-func signalOrStartHAProxy(evt chan int) {
-	haproxyDesiredState = true
-	if haproxy == nil {
-
-		if binary, err := exec.LookPath("haproxy"); err == nil {
-			go func() {
-				restarts := 0
-				for restarts < 5 {
-					var procAttr os.ProcAttr
-					procAttr.Files = []*os.File{os.Stdin, os.Stdout, os.Stderr}
-					fmt.Println("Starting haproxy lb...")
-					haproxy, err = os.StartProcess(binary, []string{"-W", "-db", "-f", "/usr/local/etc/haproxy/haproxy.cfg"}, &procAttr)
-					if err != nil {
-						panic(err)
-					}
-					fmt.Println("Started haproxy with pid", haproxy.Pid)
-
-					haproxy.Wait()
-					if haproxyDesiredState {
-						fmt.Println("haproxy died, restarting in 10 seconds")
-						time.Sleep(10 * time.Second)
-						haproxy.Kill()
-						haproxy = nil
-						restarts++
-					} else {
-						fmt.Println("haproxy stopped.")
-						haproxy = nil
-						return
-					}
-
-				}
-				fmt.Println("haproxy has restarted", restarts, "times. Terminating loadbalancer")
-				evt <- -1
-			}()
-
-		} else {
-			fmt.Println("haproxy executable not found on system")
-			evt <- -1
+			if pid, err = strconv.Atoi(string(firstLine)); err != nil {
+				pid = -1
+				log.Println(err)
+			}
 		}
 
-	} else {
-		fmt.Println("Signaling HAProxy with SIGUSR2, pid", haproxy.Pid)
-		haproxy.Signal(syscall.SIGUSR2)
+		if pid > 0 {
+			if process, err = os.FindProcess(pid); err == nil {
+				if process.Signal(syscall.Signal(0x0)) != nil { // el signal 0 no fa res, pero dona error si el pid no existeix
+					pid = -1
+				}
+			} else {
+				pid = -1
+			}
+		}
 	}
 
+	return
+}
+
+func startNewHAProxy() {
+
+	args := make([]string, 0)
+	args = append(args, "-W", "-f", haproxyConfig)
+
+	if pid, _ := findRunningHAProxyPid(); pid > 0 {
+		args = append(args, "-x", haproxySock, "-sf", strconv.Itoa(pid))
+	}
+
+	log.Println("Starting new HAProxy instance: ", haproxyBinary, strings.Join(args, " "))
+
+	procAttr := &os.ProcAttr{
+		Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
+	}
+
+	if currentHAProxy, err := os.StartProcess(haproxyBinary, args, procAttr); err == nil {
+		go func(process *os.Process) {
+			process.Wait()
+			log.Println("Master HAProxy started with pid", currentHAProxy.Pid, "has finished")
+		}(currentHAProxy)
+		time.Sleep(1 * time.Second)
+	} else {
+		log.Fatal("Error ocurred while starting a new HAProxy instance", err)
+	}
 }
