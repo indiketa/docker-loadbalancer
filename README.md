@@ -151,3 +151,5 @@ backend port_{{$value.Publish.IP}}_{{$value.Publish.Port}}_backends
 
 20/08/2021 - Achiveved 0 packet loss between reconfigurations (HAProxy restarts): All connections are handled in a separated socket file, the old (dying) HAProxy sends the state to the new HAProxy instance.
 
+20/08/2021 - Containers can configure HAProxy as SSL Termination endpoint using the label  `lb.ssl=/ssl/certificate.pem` (file /ssl/certificate.pem must exist in the HAProxy filesystem)
+
